@@ -1,5 +1,5 @@
 /**
- * YouTube Ad Shield — Content Script (v4.0)
+ * YouTube Ad Shield — Content Script (v4.1)
  * ==========================================
  * Runs in ISOLATED world (has chrome.storage access).
  * Two-layer defense:
@@ -40,19 +40,14 @@
     }
   `;
 
-  // CSS to hide the video element itself when an ad is active
+  // CSS to hide ad overlays when an ad is active (don't touch the video element itself)
   const AD_HIDE_CSS = `
-    .ad-showing video,
-    .ad-interrupting video {
-      opacity: 0 !important;
-      visibility: hidden !important;
-      height: 0 !important;
-      pointer-events: none !important;
-    }
     .ad-showing .ytp-ad-player-overlay-layout,
     .ad-showing .ytp-ad-action-interstitial,
+    .ad-showing .ytp-ad-overlay-container,
     .ad-interrupting .ytp-ad-player-overlay-layout,
-    .ad-interrupting .ytp-ad-action-interstitial {
+    .ad-interrupting .ytp-ad-action-interstitial,
+    .ad-interrupting .ytp-ad-overlay-container {
       display: none !important;
     }
   `;
@@ -64,6 +59,7 @@
   let userPlaybackRate = 1.0;
   let userMuteState = false;
   let lastAdCountTime = 0;
+  let adVideoElement = null; // track which video element is the ad
 
   // ─── Counter ───────────────────────────────────────────────────────
   function incrementAdCount() {
@@ -105,16 +101,17 @@
     const player = getPlayer();
     if (!player) return false;
 
-    // Primary: YouTube's native class
+    // Primary: YouTube's native class — this is the ONLY reliable indicator
     if (player.classList.contains('ad-showing') || player.classList.contains('ad-interrupting')) {
       return true;
     }
 
-    // Fallback: check for visible ad overlay or skip button inside player
-    const adIndicators = player.querySelectorAll(
-      '.ytp-ad-player-overlay, .ytp-ad-player-overlay-layout, .ytp-ad-text, .ytp-ad-preview-text'
+    // Conservative fallback: only check for actual skip buttons being visible,
+    // NOT generic ad text elements which persist in DOM after ads end.
+    const skipButtons = player.querySelectorAll(
+      '.ytp-ad-skip-button, .ytp-ad-skip-button-modern, .ytp-skip-ad-button'
     );
-    for (const el of adIndicators) {
+    for (const el of skipButtons) {
       const rect = el.getBoundingClientRect();
       if (rect.width > 0 && rect.height > 0) return true;
     }
@@ -125,9 +122,14 @@
   // ─── Video Selection ──────────────────────────────────────────────
   function getVideo() {
     const player = getPlayer();
-    if (!player) return document.querySelector('video');
-    return player.querySelector('video') || document.querySelector('video');
+    if (!player) return null; // never operate on video outside the player
+    return player.querySelector('video') || null;
   }
+
+  // ─── Check if this video is actually an ad video ──────────────────
+  // YouTube reuses the same <video> element for ads and content.
+  // We can't reliably distinguish them by duration alone during transitions.
+  // Instead, we rely purely on the player's class state.
 
   // ─── Skip Button Clicker ──────────────────────────────────────────
   function clickSkipButtons() {
@@ -172,38 +174,45 @@
 
     incrementAdCount();
 
+    // Track which video element is the ad
+    adVideoElement = video;
+
     // Save user state before we override
-    if (video.playbackRate !== 16) {
-      userPlaybackRate = video.playbackRate;
-    }
     if (!video.__adMuted) {
+      userPlaybackRate = video.playbackRate || 1.0;
       userMuteState = video.muted;
     }
     video.__adMuted = true;
 
-    // Mute + speed up
+    // Mute the ad — this is always safe
     video.muted = true;
-    try { video.playbackRate = 16; } catch (e) {}
 
-    // Skip to near-end
-    if (video.duration && !isNaN(video.duration) && isFinite(video.duration)) {
-      if (video.duration > 0.5 && video.currentTime < video.duration - 0.5) {
-        video.currentTime = video.duration - 0.1;
-      }
-    }
+    // DO NOT set video.currentTime — YouTube shares the same <video>
+    // element between ads and content, so skipping to near-end can
+    // cause the real video to jump 15-20 seconds ahead.
+    // DO NOT set playbackRate to 16 — same risk of bleeding into content.
 
-    // Click skip buttons
+    // Click skip buttons — this is the primary and safest skip mechanism
     clickSkipButtons();
   }
 
   function restoreAfterAd() {
-    const video = getVideo();
+    // Restore on the tracked ad video element OR the current video
+    const video = adVideoElement || getVideo();
     if (video) {
       if (video.__adMuted) {
         video.muted = userMuteState;
         delete video.__adMuted;
       }
       try { video.playbackRate = userPlaybackRate; } catch (e) {}
+    }
+    adVideoElement = null;
+
+    // Also ensure the current video (which may be different after ad) is clean
+    const currentVideo = getVideo();
+    if (currentVideo && currentVideo !== video) {
+      try { currentVideo.playbackRate = userPlaybackRate; } catch (e) {}
+      currentVideo.muted = userMuteState;
     }
   }
 

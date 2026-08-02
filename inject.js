@@ -1,5 +1,5 @@
 /**
- * YouTube Ad Shield — API Interceptor (v4.0)
+ * YouTube Ad Shield — API Interceptor (v4.1)
  * ==========================================
  * Runs in the MAIN execution world (page context).
  * Strips ad data from YouTube's API responses before the player sees them.
@@ -226,50 +226,17 @@
     }
   } catch (e) {}
 
-  // ─── Playback overrides (only during actual video ads) ───────────
-  function isPlayerShowingAd() {
-    const p = document.querySelector('#movie_player');
-    return p && (p.classList.contains('ad-showing') || p.classList.contains('ad-interrupting'));
-  }
+  // ─── Playback overrides REMOVED ────────────────────────────────────
+  // Previously we overrode HTMLMediaElement.prototype.playbackRate, .muted,
+  // and .play() to force 16x speed during ads. This was REMOVED because
+  // YouTube reuses the same <video> element for both ads and content.
+  // During the ad→content transition, these overrides would briefly apply
+  // to the real video, causing it to jump 15-20 seconds ahead.
+  //
+  // Ad blocking is now handled safely by:
+  //   1. API interceptor (fetch/XHR) strips ad data before the player sees it
+  //   2. content.js mutes the video and clicks skip buttons
+  //   3. CSS hides ad overlays and banners
 
-  try {
-    const descRate = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'playbackRate');
-    const descMuted = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'muted');
-
-    if (descRate) {
-      Object.defineProperty(HTMLMediaElement.prototype, 'playbackRate', {
-        get() {
-          if (isPlayerShowingAd()) return 16;
-          return descRate.get.call(this);
-        },
-        set(val) {
-          descRate.set.call(this, isPlayerShowingAd() ? 16 : val);
-        },
-        configurable: true
-      });
-    }
-
-    if (descMuted) {
-      Object.defineProperty(HTMLMediaElement.prototype, 'muted', {
-        get() {
-          if (isPlayerShowingAd()) return true;
-          return descMuted.get.call(this);
-        },
-        set(val) {
-          descMuted.set.call(this, isPlayerShowingAd() ? true : val);
-        },
-        configurable: true
-      });
-    }
-
-    const origPlay = HTMLMediaElement.prototype.play;
-    HTMLMediaElement.prototype.play = function () {
-      if (isPlayerShowingAd()) {
-        try { this.muted = true; this.playbackRate = 16; } catch (e) {}
-      }
-      return origPlay.apply(this, arguments);
-    };
-  } catch (e) {}
-
-  console.log('[YT-AdShield] API interceptor v4.0 initialized.');
+  console.log('[YT-AdShield] API interceptor v4.1 initialized.');
 })();
