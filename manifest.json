@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "YouTube Ad Shield & Skipper",
-  "version": "4.0.0",
+  "version": "5.1.0",
   "description": "Mutes and automatically skips video ads, and hides banners/overlays on YouTube.",
   "author": "Developer",
 
@@ -22,8 +22,7 @@
   },
 
   "host_permissions": [
-    "*://*.youtube.com/*",
-    "*://*.youtube.com./*"
+    "*://*.youtube.com/*"
   ],
 
   "background": {
@@ -32,19 +31,13 @@
 
   "content_scripts": [
     {
-      "matches": [
-        "*://*.youtube.com/*",
-        "*://*.youtube.com./*"
-      ],
+      "matches": ["*://*.youtube.com/*"],
       "js": ["inject.js"],
       "run_at": "document_start",
       "world": "MAIN"
     },
     {
-      "matches": [
-        "*://*.youtube.com/*",
-        "*://*.youtube.com./*"
-      ],
+      "matches": ["*://*.youtube.com/*"],
       "js": ["content.js"],
       "run_at": "document_start"
     }
