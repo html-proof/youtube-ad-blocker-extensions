@@ -1,22 +1,21 @@
 /**
- * YouTube Ad Shield — Content Script (v5.0)
+ * YouTube Ad Shield — Content Script (v6.0)
  * ==========================================
- * Aggressive multi-layer ad elimination:
- *   1. CSS hides feed/banner/overlay ads instantly.
- *   2. Speed-forces ads to 16x (they end in ~1 sec).
- *   3. Seeks to end of skippable ads immediately.
- *   4. Clicks skip buttons.
- *   5. MutationObserver + interval for zero-latency detection.
+ * Four-layer defence:
+ *   1. CSS hides banner/overlay/sidebar ads.
+ *   2. Anti-adblock modal auto-dismissed.
+ *   3. Video ads muted + sped to 16x the moment ad-showing class appears.
+ *   4. Skip button clicked repeatedly until gone.
  */
 
 (function () {
   'use strict';
 
-  const STYLE_ID = 'yt-ad-shield-styles';
+  const STYLE_ID = 'yt-ad-shield-v6';
 
-  // ─── Comprehensive CSS — covers 2024/2025 YouTube ad elements ────────
+  // ─── CSS ────────────────────────────────────────────────────────────────
   const AD_CSS = `
-    /* In-feed / sidebar ads */
+    /* Feed / sidebar / banner ads */
     ytd-promoted-sparkles-web-renderer,
     ytd-promoted-video-renderer,
     ytd-player-legacy-ad-renderer,
@@ -29,84 +28,55 @@
     ytd-banner-promo-renderer,
     ytd-carousel-ad-renderer,
     ytd-promoted-sparkles-text-search-renderer,
-    ytd-ad-slot-renderer[class*="ad"],
     [layout="in-feed-ad-layout"],
-    #rendering-content ytd-in-feed-ad-layout-renderer,
     #masthead-ad,
     #player-ads,
-    .ytd-display-ad-renderer,
 
-    /* Overlay ads inside the player */
+    /* Overlay ads inside player */
     .ytp-ad-overlay-container,
     .ytp-ad-image-overlay,
     .ytp-ad-text-overlay,
     .ytp-ad-overlay-close-container,
-    .ytp-ad-overlay-ad-info-button-container,
 
-    /* Survey / companion cards */
-    .ytp-ad-action-interstitial,
-    .ytp-ad-action-interstitial-background,
-    .ytp-ad-action-interstitial-slot,
-
-    /* Info bar ("Ad · X:XX left") — hidden via CSS so user doesn't see it */
+    /* Ad info / visit-advertiser strip */
     .ytp-ad-player-overlay-layout,
     .ytp-ad-player-overlay,
     .ytp-ad-simple-ad-badge,
     .ytp-ad-button-icon,
     .ytp-ad-visit-advertiser-button,
     .ytp-ad-clickable-overlay,
+    .ytp-ad-action-interstitial,
+    .ytp-ad-action-interstitial-slot,
 
-    /* Shopping ads */
+    /* Progress-bar ad markers */
+    .ytp-ad-progress,
+    .ytp-ad-progress-list,
+
+    /* Shopping / rich ads */
     ytd-rich-item-renderer:has(ytd-ad-slot-renderer),
-
-    /* Any generic "ad" containers YouTube uses */
-    [class*="__ad-badge"],
-    [aria-label="Ads"],
-    [data-ad-slot-id] {
+    [data-ad-slot-id],
+    [aria-label="Ads"] {
       display: none !important;
       height: 0 !important;
       min-height: 0 !important;
-      width: 0 !important;
-      overflow: hidden !important;
       pointer-events: none !important;
       opacity: 0 !important;
     }
-
-    /* Keep video visible during ad (we speed it up instead of hiding) */
-    .ad-showing video,
-    .ad-interrupting video {
-      opacity: 1 !important;
-    }
-
-    /* Hide progress bar ad markers */
-    .ytp-ad-progress,
-    .ytp-ad-progress-list {
-      display: none !important;
-    }
   `;
 
-  let extensionEnabled = true;
+  // ─── State ───────────────────────────────────────────────────────────────
+  let enabled = true;
   let adObserver = null;
   let childObserver = null;
-  let checkInterval = null;
-  let userPlaybackRate = 1.0;
-  let userMuted = false;
+  let interval = null;
+  let modalInterval = null;
   let wasAdActive = false;
-  let lastAdCountTime = 0;
-  let lastTickTime = 0;
-  let adSkipAttempts = 0;
+  let lastTick = 0;
+  let lastAdCount = 0;
+  let userRate = 1.0;
+  let userMuted = false;
 
-  // ─── Counter ─────────────────────────────────────────────────────────
-  function incrementAdCount() {
-    const now = Date.now();
-    if (now - lastAdCountTime < 1500) return;
-    lastAdCountTime = now;
-    chrome.storage.local.get({ adsSkipped: 0 }, (data) => {
-      chrome.storage.local.set({ adsSkipped: data.adsSkipped + 1 });
-    });
-  }
-
-  // ─── Styles ──────────────────────────────────────────────────────────
+  // ─── Styles ──────────────────────────────────────────────────────────────
   function injectStyles() {
     if (document.getElementById(STYLE_ID)) return;
     const s = document.createElement('style');
@@ -114,256 +84,232 @@
     s.textContent = AD_CSS;
     (document.head || document.documentElement).appendChild(s);
   }
+  function removeStyles() { document.getElementById(STYLE_ID)?.remove(); }
 
-  function removeStyles() {
-    document.getElementById(STYLE_ID)?.remove();
-  }
-
-  // ─── Player / Video helpers ───────────────────────────────────────────
-  function getPlayer() {
-    return document.querySelector('#movie_player');
-  }
-
+  // ─── Helpers ─────────────────────────────────────────────────────────────
+  function getPlayer() { return document.querySelector('#movie_player, .html5-video-player'); }
   function getVideo() {
     const p = getPlayer();
     return p ? p.querySelector('video') : null;
   }
 
-  // ─── Ad detection ─────────────────────────────────────────────────────
   function isAdActive() {
-    const player = getPlayer();
-    if (!player) return false;
-
-    // Primary signal: YouTube's own class
-    if (player.classList.contains('ad-showing') || player.classList.contains('ad-interrupting')) {
-      return true;
-    }
-
-    // Secondary: visible skip or countdown elements inside the player
-    const adIndicators = player.querySelectorAll(
-      '.ytp-ad-skip-button, .ytp-ad-skip-button-modern, .ytp-skip-ad-button, ' +
-      '.ytp-ad-duration-remaining, .ytp-ad-simple-ad-badge'
-    );
-    for (const el of adIndicators) {
+    const p = getPlayer();
+    if (!p) return false;
+    if (p.classList.contains('ad-showing') || p.classList.contains('ad-interrupting')) return true;
+    // Backup: visible skip or countdown element
+    for (const el of p.querySelectorAll(
+      '.ytp-ad-skip-button,.ytp-ad-skip-button-modern,.ytp-skip-ad-button,.ytp-ad-duration-remaining'
+    )) {
       const r = el.getBoundingClientRect();
       if (r.width > 0 && r.height > 0) return true;
     }
-
     return false;
   }
 
-  // ─── Click all skip buttons ──────────────────────────────────────────
-  function clickSkip() {
-    const player = getPlayer();
-    if (!player) return false;
+  // ─── Counter ─────────────────────────────────────────────────────────────
+  function incrementCount() {
+    const now = Date.now();
+    if (now - lastAdCount < 1500) return;
+    lastAdCount = now;
+    chrome.storage.local.get({ adsSkipped: 0 }, d =>
+      chrome.storage.local.set({ adsSkipped: d.adsSkipped + 1 })
+    );
+  }
 
-    const selectors = [
+  // ─── Track user prefs via events (not sampled from mid-ad video) ─────────
+  function trackPrefs(video) {
+    if (video.__prefTracked) return;
+    video.__prefTracked = true;
+    video.addEventListener('ratechange', () => { if (!isAdActive()) userRate = video.playbackRate; });
+    video.addEventListener('volumechange', () => { if (!isAdActive()) userMuted = video.muted; });
+  }
+
+  // ─── Click every possible skip button ────────────────────────────────────
+  function clickSkip() {
+    const p = getPlayer();
+    if (!p) return;
+    const sels = [
       '.ytp-ad-skip-button',
       '.ytp-ad-skip-button-modern',
       '.ytp-skip-ad-button',
       '.ytp-ad-skip-button-slot button',
-      'button[class*="skip"]',
-      '[id*="skip-button"]',
     ];
+    for (const sel of sels) {
+      for (const btn of p.querySelectorAll(sel)) {
+        try { btn.click(); } catch (_) {}
+      }
+    }
+    // Language-agnostic skip via aria-label
+    for (const btn of p.querySelectorAll('button[aria-label]')) {
+      if ((btn.getAttribute('aria-label') || '').toLowerCase().includes('skip')) {
+        try { btn.click(); } catch (_) {}
+      }
+    }
+  }
 
-    let clicked = false;
-    for (const sel of selectors) {
-      for (const btn of player.querySelectorAll(sel)) {
-        const r = btn.getBoundingClientRect();
-        if (r.width > 0 || r.height > 0) {
-          try { btn.click(); clicked = true; } catch (e) {}
+  // ─── Anti-adblock modal dismissal ────────────────────────────────────────
+  // YouTube shows "Ad blockers aren't allowed" which pauses playback.
+  // We click the dismiss button and force-resume the video.
+  function dismissAntiAdblock() {
+    // Dismiss known modal containers
+    const containers = document.querySelectorAll(
+      'ytd-enforcement-message-view-model, yt-confirm-dialog-renderer'
+    );
+    for (const el of containers) {
+      // Click #dismiss-button if present
+      const dismiss = el.querySelector('#dismiss-button button, #dismiss-button');
+      if (dismiss) { try { dismiss.click(); } catch (_) {} }
+
+      // Click any button whose text looks like a confirmation
+      for (const btn of el.querySelectorAll('button, tp-yt-paper-button')) {
+        const text = (btn.textContent || '').trim().toLowerCase();
+        if (
+          text === 'ok' ||
+          text === 'continue' ||
+          text === 'i understand' ||
+          text.includes('continue watching') ||
+          text.includes('proceed') ||
+          text.includes('got it')
+        ) {
+          try { btn.click(); } catch (_) {}
         }
       }
     }
 
-    // Language-agnostic: any visible button with "skip" in aria-label
-    for (const btn of player.querySelectorAll('button[aria-label]')) {
-      const label = (btn.getAttribute('aria-label') || '').toLowerCase();
-      if (label.includes('skip')) {
-        try { btn.click(); clicked = true; } catch (e) {}
-      }
+    // If the video was paused by the modal and no ad is active, resume it
+    const video = getVideo();
+    if (video && video.paused && !isAdActive()) {
+      try { video.play(); } catch (_) {}
     }
 
-    return clicked;
-  }
-
-  // ─── Track user preferences via events (not sampled from mid-ad video) ──
-  // inject.js's play() override may have already set playbackRate=16 and
-  // muted=true before our first MutationObserver tick fires. Capturing
-  // video.playbackRate inside handleAd() would save 16 as the "user" rate.
-  // Instead, we listen to ratechange/volumechange during CONTENT playback.
-  function trackUserPreferences(video) {
-    if (video.__prefTracked) return;
-    video.__prefTracked = true;
-    video.addEventListener('ratechange', () => {
-      if (!isAdActive()) userPlaybackRate = video.playbackRate;
-    });
-    video.addEventListener('volumechange', () => {
-      if (!isAdActive()) userMuted = video.muted;
+    // Also remove the backdrop overlay that greys out the page
+    document.querySelectorAll(
+      'tp-yt-iron-overlay-backdrop[opened], ytd-enforcement-message-view-model'
+    ).forEach(el => {
+      if (el.tagName.toLowerCase() === 'ytd-enforcement-message-view-model') {
+        el.style.setProperty('display', 'none', 'important');
+      } else {
+        // Remove backdrop so video underneath is accessible
+        el.removeAttribute('opened');
+        el.style.setProperty('display', 'none', 'important');
+      }
     });
   }
 
-  // ─── Core ad handler ─────────────────────────────────────────────────
+  // ─── Handle an active ad ──────────────────────────────────────────────────
   function handleAd() {
     const video = getVideo();
     if (!video) return;
 
-    trackUserPreferences(video);
-    incrementAdCount();
+    trackPrefs(video);
+    incrementCount();
 
-    if (!video.__adHandled) {
-      video.__adHandled = true;
-      adSkipAttempts = 0;
-    }
-
-    // Always mute the ad
+    // Mute immediately
     video.muted = true;
 
-    // Strategy 1: Jump to end of skippable ads (short duration = ad)
-    if (video.duration && isFinite(video.duration) && video.duration > 0 && video.duration < 90) {
-      const remaining = video.duration - video.currentTime;
-      if (remaining > 0.5) {
-        try {
-          video.currentTime = video.duration - 0.1;
-        } catch (e) {}
+    // Speed to 16x — ad ends in ~1 second
+    try { if (video.playbackRate < 16) video.playbackRate = 16; } catch (_) {}
+
+    // Seek to near end for skippable ads with known duration
+    if (video.duration && isFinite(video.duration) && video.duration < 90) {
+      if (video.duration - video.currentTime > 0.5) {
+        try { video.currentTime = video.duration - 0.1; } catch (_) {}
       }
     }
 
-    // Strategy 2: Speed up to 16x so non-skippable ads end in ~1 second
-    try {
-      if (video.playbackRate < 16) {
-        video.playbackRate = 16;
-      }
-    } catch (e) {}
-
-    // Strategy 3: Click skip button (works after time-jump triggers skipability)
+    // Hammer skip button
     clickSkip();
-    adSkipAttempts++;
-
-    // Strategy 4: Hammer skip button for a short window after detection
-    if (adSkipAttempts < 5) {
-      setTimeout(clickSkip, 100);
-      setTimeout(clickSkip, 300);
-      setTimeout(clickSkip, 600);
-    }
+    setTimeout(clickSkip, 100);
+    setTimeout(clickSkip, 400);
+    setTimeout(clickSkip, 900);
   }
 
   function restoreAfterAd() {
-    const video = getVideo();
-    if (video && video.__adHandled) {
-      // Small delay to avoid restoring during the ad→content transition
-      setTimeout(() => {
-        const v = getVideo();
-        if (v) {
-          try { v.playbackRate = userPlaybackRate; } catch (e) {}
-          v.muted = userMuted;
-        }
-        delete video.__adHandled;
-      }, 200);
-    }
+    setTimeout(() => {
+      const v = getVideo();
+      if (!v) return;
+      try { v.playbackRate = userRate; } catch (_) {}
+      v.muted = userMuted;
+    }, 300);
   }
 
-  // ─── Tick ─────────────────────────────────────────────────────────────
+  // ─── Tick ─────────────────────────────────────────────────────────────────
   function tick() {
-    if (!extensionEnabled) return;
-
+    if (!enabled) return;
     const now = Date.now();
-    if (now - lastTickTime < 150) return;
-    lastTickTime = now;
+    if (now - lastTick < 150) return;
+    lastTick = now;
 
     const adNow = isAdActive();
-    if (adNow) {
-      handleAd();
-      wasAdActive = true;
-    } else if (wasAdActive) {
-      restoreAfterAd();
-      wasAdActive = false;
-    }
+    if (adNow) { handleAd(); wasAdActive = true; }
+    else if (wasAdActive) { restoreAfterAd(); wasAdActive = false; }
   }
 
-  // ─── Observer setup ───────────────────────────────────────────────────
+  // ─── Observer setup ───────────────────────────────────────────────────────
   function startObserver() {
     if (adObserver) return;
-
-    const player = getPlayer();
-    if (player) {
-      // Watch class changes on the player (ad-showing toggled here)
+    const p = getPlayer();
+    if (p) {
       adObserver = new MutationObserver(tick);
-      adObserver.observe(player, { attributes: true, attributeFilter: ['class'] });
+      adObserver.observe(p, { attributes: true, attributeFilter: ['class'] });
 
-      // Watch direct children only (skip button container added at this level)
-      // Deliberately NOT subtree:true to avoid firing on every caption/progress update
+      // Watch direct children only (skip button container appears here)
       childObserver = new MutationObserver(tick);
-      childObserver.observe(player, { childList: true, subtree: false });
+      childObserver.observe(p, { childList: true, subtree: false });
     }
+    interval = setInterval(tick, 250);
 
-    // Fallback interval — catches anything observer misses
-    checkInterval = setInterval(tick, 250);
+    // Anti-adblock modal check — runs every 500ms independently
+    modalInterval = setInterval(dismissAntiAdblock, 500);
   }
 
   function stopObserver() {
-    adObserver?.disconnect();
-    adObserver = null;
-    childObserver?.disconnect();
-    childObserver = null;
-    if (checkInterval) { clearInterval(checkInterval); checkInterval = null; }
+    adObserver?.disconnect(); adObserver = null;
+    childObserver?.disconnect(); childObserver = null;
+    if (interval) { clearInterval(interval); interval = null; }
+    if (modalInterval) { clearInterval(modalInterval); modalInterval = null; }
   }
 
   function waitForPlayer() {
-    if (getPlayer()) {
-      startObserver();
-      return;
-    }
+    if (getPlayer()) { startObserver(); return; }
     const obs = new MutationObserver(() => {
       if (getPlayer()) { obs.disconnect(); startObserver(); }
     });
     obs.observe(document.documentElement, { childList: true, subtree: true });
   }
 
-  // ─── Lifecycle ────────────────────────────────────────────────────────
+  // ─── Lifecycle ────────────────────────────────────────────────────────────
   function updateState() {
-    if (extensionEnabled) {
-      injectStyles();
-      waitForPlayer();
-    } else {
-      removeStyles();
-      stopObserver();
-      restoreAfterAd();
-    }
+    if (enabled) { injectStyles(); waitForPlayer(); }
+    else { removeStyles(); stopObserver(); restoreAfterAd(); }
   }
 
-  // ─── Handle YouTube's SPA navigation ─────────────────────────────────
-  // YouTube navigates without full page reload; re-attach after navigation.
+  // SPA navigation re-attach
   document.addEventListener('yt-navigate-finish', () => {
-    if (!extensionEnabled) return;
+    if (!enabled) return;
     stopObserver();
-    adObserver = null;
     wasAdActive = false;
     waitForPlayer();
   });
 
-  // ─── Init ─────────────────────────────────────────────────────────────
-  injectStyles(); // inject CSS as early as possible
+  // Also catch the anti-adblock modal on page load
+  document.addEventListener('yt-page-data-updated', dismissAntiAdblock);
 
-  chrome.storage.local.get({ enabled: true }, (data) => {
-    extensionEnabled = data.enabled;
+  // ─── Init ─────────────────────────────────────────────────────────────────
+  injectStyles();
+
+  chrome.storage.local.get({ enabled: true }, d => {
+    enabled = d.enabled;
     updateState();
   });
 
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area === 'local' && changes.enabled !== undefined) {
-      extensionEnabled = changes.enabled.newValue;
+      enabled = changes.enabled.newValue;
       updateState();
     }
   });
 
-  // Signal from inject.js (MAIN world)
-  window.addEventListener('message', (event) => {
-    if (event.source !== window) return;
-    if (!event.data || event.data.type !== 'YT_AD_SHIELD_BLOCKED') return;
-    if (!extensionEnabled) return;
-    incrementAdCount();
-  });
-
-  console.log('[YT-AdShield] Content script v5.0 initialized.');
+  console.log('[YT-AdShield] content v6.0 ready.');
 })();
